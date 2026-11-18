@@ -30,3 +30,9 @@ func notSerial(name string, err error) error {
 func IsNotSerial(err error) bool {
 	return errors.Is(err, errNotSerial)
 }
+
+// IsBusy reports whether the platform refused the port because another
+// process owns it.
+func IsBusy(err error) bool {
+	return isBusy(err)
+}

@@ -8,26 +8,24 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/rootxtrem3/VaultKey_Companion/internal/prompt"
-	"github.com/rootxtrem3/VaultKey_Companion/internal/transport"
-	"github.com/rootxtrem3/VaultKey_Companion/internal/vaultkey"
+	"github.com/rootxtrem3/VaultKey_Companion/internal/apperr"
+	"github.com/rootxtrem3/VaultKey_Companion/pkg/vaultkey"
 )
 
 const (
-	exitOK                 = 0
-	exitFailure            = 1
-	exitUsage              = 2
-	exitConnection         = 3
-	exitLocked             = 4
-	exitNotAuthorized      = 5
-	exitProtocol           = 6
-	exitAmbiguousOrTimeout = 7
-	exitDeviceOperation    = 8
-	exitInterrupted        = 130
+	exitOK                 = vaultkey.ExitOK
+	exitFailure            = vaultkey.ExitFailure
+	exitUsage              = vaultkey.ExitUsage
+	exitConnection         = vaultkey.ExitConnection
+	exitLocked             = vaultkey.ExitLocked
+	exitNotAuthorized      = vaultkey.ExitNotAuthorized
+	exitProtocol           = vaultkey.ExitProtocol
+	exitAmbiguousOrTimeout = vaultkey.ExitAmbiguousOrTimeout
+	exitDeviceOperation    = vaultkey.ExitDeviceOperation
+	exitInterrupted        = vaultkey.ExitInterrupted
 )
 
 const defaultTimeout = 5 * time.Second
@@ -40,17 +38,20 @@ type app struct {
 	commit    string
 	buildDate string
 
-	port    string
-	timeout time.Duration
-	debug   bool
-	ctx     context.Context
+	port       string
+	timeout    time.Duration
+	debug      bool
+	jsonErrors bool
+	command    string
+	ctx        context.Context
 }
 
 type globalOptions struct {
-	port    string
-	timeout time.Duration
-	debug   bool
-	version bool
+	port       string
+	timeout    time.Duration
+	debug      bool
+	jsonErrors bool
+	version    bool
 }
 
 func parseGlobals(arguments []string) (globalOptions, []string, error) {
@@ -108,6 +109,8 @@ func parseGlobals(arguments []string) (globalOptions, []string, error) {
 			options.timeout = parsed
 		case argument == "--debug" || argument == "-debug":
 			options.debug = true
+		case argument == "--json-errors" || argument == "-json-errors":
+			options.jsonErrors = true
 		case argument == "--version" || argument == "-version":
 			options.version = true
 		default:
@@ -131,7 +134,11 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer,
 		return exitUsage
 	}
 	if options.version {
-		printVersion(stdout, version, commit, buildDate)
+		if containsArgument(remaining, "--json") {
+			printVersionJSON(stdout, version, commit, buildDate)
+		} else {
+			printVersion(stdout, version, commit, buildDate)
+		}
 		return exitOK
 	}
 
@@ -139,16 +146,17 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer,
 	defer stop()
 
 	application := &app{
-		stdin:     stdin,
-		stdout:    stdout,
-		stderr:    stderr,
-		version:   version,
-		commit:    commit,
-		buildDate: buildDate,
-		port:      options.port,
-		timeout:   options.timeout,
-		debug:     options.debug,
-		ctx:       ctx,
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
+		version:    version,
+		commit:     commit,
+		buildDate:  buildDate,
+		port:       options.port,
+		timeout:    options.timeout,
+		debug:      options.debug,
+		jsonErrors: options.jsonErrors,
+		ctx:        ctx,
 	}
 
 	if len(remaining) == 0 {
@@ -158,6 +166,7 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer,
 
 	command := remaining[0]
 	arguments = remaining[1:]
+	application.command = command
 	switch command {
 	case "help", "-h", "--help":
 		if len(arguments) > 0 {
@@ -167,8 +176,11 @@ func Run(arguments []string, stdin io.Reader, stdout, stderr io.Writer,
 		}
 		return exitOK
 	case "version":
-		printVersion(stdout, version, commit, buildDate)
-		return exitOK
+		return application.runVersion(arguments)
+	case "capabilities":
+		return application.runCapabilities(arguments)
+	case "session":
+		return application.runSession(arguments)
 	case "devices":
 		return application.runDevices(arguments)
 	case "info":
@@ -233,174 +245,62 @@ func (a *app) fail(err error) int {
 	if err == nil {
 		return exitOK
 	}
-	if errors.Is(err, context.Canceled) {
+	info := apperr.Classify(err)
+	if a.jsonErrors {
+		payload := struct {
+			OK      bool               `json:"ok"`
+			Command string             `json:"command"`
+			Error   vaultkey.ErrorInfo `json:"error"`
+		}{OK: false, Command: a.command, Error: info}
+		if writeErr := writeJSON(a.stdout, payload); writeErr != nil {
+			fmt.Fprintf(a.stderr, "error: %v\n", writeErr)
+		}
+		return info.ExitCode
+	}
+	if info.Kind == "interrupted" {
 		fmt.Fprintln(a.stderr, "interrupted")
-		return exitInterrupted
+		return info.ExitCode
 	}
-
-	var ambiguous *vaultkey.AmbiguousError
-	if errors.As(err, &ambiguous) {
-		fmt.Fprintf(a.stderr, "error: %v\n", ambiguous)
-		fmt.Fprintln(a.stderr, "warning: the command may have been applied. Reconnect and verify before retrying.")
-		return exitAmbiguousOrTimeout
+	fmt.Fprintln(a.stderr, apperr.FormatError(info))
+	if info.Kind == "ambiguous" {
+		fmt.Fprintf(a.stderr, "warning: %s\n", info.Hint)
+	} else if info.Hint != "" {
+		fmt.Fprintf(a.stderr, "hint: %s\n", info.Hint)
 	}
-
-	var request *vaultkey.RequestError
-	if errors.As(err, &request) {
-		fmt.Fprintf(a.stderr, "error: %v\n", request)
-		return exitUsage
-	}
-
-	var protocol *vaultkey.ProtocolError
-	if errors.As(err, &protocol) {
-		fmt.Fprintf(a.stderr, "error: %v\n", protocol)
-		fmt.Fprintln(a.stderr, "hint: reconnect the device. If this persists, update the app or firmware so both use protocol v1.")
-		return exitProtocol
-	}
-
-	var device *vaultkey.DeviceError
-	if errors.As(err, &device) {
-		message, code := deviceMessage(device)
-		fmt.Fprintf(a.stderr, "error: %s (%s)\n", message, device.Code)
-		if hint := deviceHint(device); hint != "" {
-			fmt.Fprintf(a.stderr, "hint: %s\n", hint)
-		}
-		return code
-	}
-
-	if errors.Is(err, prompt.ErrNoTerminal) {
-		fmt.Fprintln(a.stderr, "error: no interactive terminal is available")
-		fmt.Fprintln(a.stderr, "hint: run from a terminal, or use the command's non-interactive option (--yes, --password-stdin, or --uri-stdin).")
-		return exitUsage
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		fmt.Fprintln(a.stderr, "error: the device did not respond before the timeout")
-		fmt.Fprintln(a.stderr, "hint: check the cable and port, or increase --timeout")
-		return exitAmbiguousOrTimeout
-	}
-	if errors.Is(err, vaultkey.ErrClosed) {
-		fmt.Fprintln(a.stderr, "error: the device connection was closed")
-		fmt.Fprintln(a.stderr, "hint: reconnect the device and try again.")
-		return exitConnection
-	}
-	if errors.Is(err, transport.ErrUnsupported) {
-		fmt.Fprintln(a.stderr, "error: serial ports are not supported on this platform")
-		return exitConnection
-	}
-	if os.IsPermission(err) {
-		fmt.Fprintf(a.stderr, "error: %v\n", err)
-		fmt.Fprintln(a.stderr, "hint: on Linux add your user to the dialout group, or adjust the device permissions.")
-		return exitConnection
-	}
-	var pathError *os.PathError
-	if errors.As(err, &pathError) {
-		fmt.Fprintf(a.stderr, "error: %v\n", err)
-		fmt.Fprintln(a.stderr, "hint: check that the device is connected and the port is correct.")
-		return exitConnection
-	}
-	var notFound *notFoundError
-	if errors.As(err, &notFound) {
-		fmt.Fprintf(a.stderr, "error: %v\n", notFound)
-		fmt.Fprintln(a.stderr, "hint: connect the VaultKey, make sure its firmware is running, and pass --port if needed.")
-		return exitConnection
-	}
-	var multiple *multipleDevicesError
-	if errors.As(err, &multiple) {
-		fmt.Fprintf(a.stderr, "error: %v\n", multiple)
-		fmt.Fprintln(a.stderr, "hint: choose one port with --port.")
-		return exitConnection
-	}
-	if transport.IsNotSerial(err) {
-		fmt.Fprintf(a.stderr, "error: %v\n", err)
-		fmt.Fprintln(a.stderr, "hint: choose the VaultKey CDC port (for example /dev/ttyACM0 or COM5).")
-		return exitConnection
-	}
-
-	fmt.Fprintf(a.stderr, "error: %v\n", err)
-	return exitFailure
+	return info.ExitCode
 }
 
-func deviceMessage(err *vaultkey.DeviceError) (string, int) {
-	switch err.Code {
-	case "device_locked":
-		return "the device is locked", exitLocked
-	case "provisioning_not_authorized":
-		return "CDC provisioning is not authorized", exitNotAuthorized
-	case "rtc_time_invalid":
-		return "the RTC time is not valid", exitDeviceOperation
-	case "storage_failed":
-		return "the device could not save the change", exitDeviceOperation
-	case "delete_failed":
-		return "the device could not delete the entry", exitDeviceOperation
-	case "entry_not_found":
-		return "the entry was not found", exitDeviceOperation
-	case "invalid_credential", "invalid_query", "invalid_pagination",
-		"invalid_time", "invalid_uri", "invalid_totp", "invalid_entry_type":
-		return "the device rejected the request: " + err.Code, exitUsage
-	default:
-		return "the device returned an error", exitFailure
+func (a *app) openOptions(port string) vaultkey.OpenOptions {
+	options := vaultkey.OpenOptions{
+		Port:         port,
+		ProbeTimeout: a.probeTimeout(),
+		Version:      a.version,
+		Commit:       a.commit,
+		BuildDate:    a.buildDate,
 	}
-}
-
-func deviceHint(err *vaultkey.DeviceError) string {
-	switch err.Code {
-	case "device_locked":
-		return "unlock the device with its PIN, then retry."
-	case "provisioning_not_authorized":
-		return `on the device open USB Functions and choose "Authorize CDC 5 min".`
-	case "rtc_time_invalid":
-		return "set the clock with `vaultkey time set`, or from the device settings."
-	case "invalid_totp":
-		if err.Detail != "" {
-			return "the TOTP URI was rejected: " + err.Detail
-		}
-		return "check the otpauth://totp/ URI, Base32 secret, digits, period, and algorithm."
-	default:
-		return ""
-	}
-}
-
-func (a *app) connect() (*vaultkey.Client, vaultkey.Hello, error) {
-	port := a.port
-	if port == "" {
-		detected, err := a.detectPort()
-		if err != nil {
-			return nil, vaultkey.Hello{}, err
-		}
-		port = detected
-		a.debugf("auto-detected %s", port)
-	}
-	return a.openPort(port)
-}
-
-func (a *app) openPort(port string) (*vaultkey.Client, vaultkey.Hello, error) {
-	serial, err := transport.Open(port)
-	if err != nil {
-		return nil, vaultkey.Hello{}, err
-	}
-	client := vaultkey.New(serial)
 	if a.debug {
-		client.SetLogger(func(message string) { fmt.Fprintln(a.stderr, "debug: "+message) })
+		options.Logger = func(message string) { fmt.Fprintln(a.stderr, "debug: "+message) }
 	}
+	return options
+}
 
-	ctx, cancel := context.WithTimeout(a.ctx, a.probeTimeout())
-	defer cancel()
-	hello, err := client.Hello(ctx)
-	if err != nil {
-		client.Close()
-		return nil, vaultkey.Hello{}, err
+func (a *app) openWithContext(ctx context.Context) (*vaultkey.Session, error) {
+	return vaultkey.Open(ctx, a.openOptions(a.port))
+}
+
+func (a *app) openPortWithContext(ctx context.Context, port string) (*vaultkey.Session, error) {
+	if port == "" {
+		port = a.port
 	}
-	if hello.Product != "VaultKey" {
-		client.Close()
-		return nil, vaultkey.Hello{}, fmt.Errorf(
-			"%s responded as %q, not VaultKey", port, hello.Product)
+	return vaultkey.Open(ctx, a.openOptions(port))
+}
+
+func (a *app) connect() (*vaultkey.Session, error) {
+	session, err := a.openWithContext(a.ctx)
+	if err == nil && a.port == "" {
+		a.debugf("auto-detected %s", session.PortName())
 	}
-	if hello.Protocol != vaultkey.ProtocolVersion {
-		client.Close()
-		return nil, vaultkey.Hello{}, &vaultkey.ProtocolError{Message: fmt.Sprintf(
-			"device protocol is %d; this app supports %d", hello.Protocol, vaultkey.ProtocolVersion)}
-	}
-	return client, hello, nil
+	return session, err
 }
 
 func (a *app) probeTimeout() time.Duration {
@@ -409,101 +309,6 @@ func (a *app) probeTimeout() time.Duration {
 		timeout = a.timeout
 	}
 	return timeout
-}
-
-type probeResult struct {
-	port    string
-	hello   vaultkey.Hello
-	err     error
-	product string
-}
-
-type notFoundError struct {
-	results []probeResult
-	reason  error
-}
-
-func (e *notFoundError) Error() string {
-	if e.reason != nil {
-		return "could not find a VaultKey: " + e.reason.Error()
-	}
-	if len(e.results) == 0 {
-		return "no candidate VaultKey serial ports were found"
-	}
-	var builder strings.Builder
-	builder.WriteString("no VaultKey answered on the candidate ports:")
-	for _, result := range e.results {
-		builder.WriteString("\n  ")
-		builder.WriteString(result.port)
-		builder.WriteString(": ")
-		if result.err != nil {
-			builder.WriteString(result.err.Error())
-		} else if result.product != "" {
-			builder.WriteString("device identifies as " + result.product)
-		} else {
-			builder.WriteString("no valid response")
-		}
-	}
-	return builder.String()
-}
-
-type multipleDevicesError struct {
-	ports []string
-}
-
-func (e *multipleDevicesError) Error() string {
-	return "multiple VaultKey devices found: " + strings.Join(e.ports, ", ")
-}
-
-func (a *app) detectPort() (string, error) {
-	ports, err := transport.Candidates()
-	if err != nil {
-		return "", &notFoundError{reason: err}
-	}
-	if len(ports) == 0 {
-		return "", &notFoundError{}
-	}
-
-	results := make([]probeResult, 0, len(ports))
-	vaultkeys := make([]string, 0, 1)
-	for _, port := range ports {
-		result := a.probe(port)
-		results = append(results, result)
-		if result.err == nil && result.product == "VaultKey" {
-			vaultkeys = append(vaultkeys, port)
-		}
-	}
-	sort.Strings(vaultkeys)
-	switch len(vaultkeys) {
-	case 0:
-		return "", &notFoundError{results: results}
-	case 1:
-		return vaultkeys[0], nil
-	default:
-		return "", &multipleDevicesError{ports: vaultkeys}
-	}
-}
-
-func (a *app) probe(port string) probeResult {
-	result := probeResult{port: port}
-	serial, err := transport.Open(port)
-	if err != nil {
-		result.err = err
-		return result
-	}
-	client := vaultkey.New(serial)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(a.ctx, a.probeTimeout())
-	defer cancel()
-	hello, err := client.Hello(ctx)
-	if err != nil {
-		result.err = err
-		return result
-	}
-	result.hello = hello
-	result.product = hello.Product
-	return result
 }
 
 func printVersion(writer io.Writer, version, commit, buildDate string) {
@@ -526,10 +331,13 @@ Global options:
   --port PATH       Serial port (default: auto-detect, env VAULTKEY_PORT)
   --timeout DUR     Per-request timeout, 500ms-1m (default 5s)
   --debug           Log command names, sizes, and status only
+  --json-errors     Write one JSON error object to stdout on failure
   --version         Print the app version
   -h, --help        Show help
 
 Commands:
+  session              Run the long-lived JSON Lines UI session
+  capabilities         Describe the machine interface (no device access)
   devices              Probe candidate serial ports for VaultKey
   info                 Show device identity
   status               Show lock, RTC, storage, and USB state
@@ -559,6 +367,24 @@ Run "vaultkey help <command>" for command options.
 
 func printCommandHelp(writer io.Writer, command string) {
 	switch command {
+	case "session":
+		fmt.Fprint(writer, `Usage: vaultkey session [--port PATH] [--timeout DUR] [--debug]
+
+Runs one long-lived connection and speaks JSON Lines over stdin/stdout. This is
+the interface the desktop app uses: one process owns the serial port so the
+firmware's five-minute CDC authorization is not revoked between commands.
+
+stdout carries only protocol JSON; diagnostics go to stderr. The first line is
+a "ready" event. Send {"id":1,"method":"capabilities"} to negotiate, then use
+status, list, time.get/time.set, credentials.add/update, totp.add, delete,
+lock, watch.start/watch.stop, reconnect, doctor, and shutdown.
+`)
+	case "capabilities":
+		fmt.Fprint(writer, `Usage: vaultkey capabilities [--json]
+
+Describes the session protocol, app platform, firmware limits, supported
+methods, features, and exit codes. It never opens a serial port.
+`)
 	case "devices":
 		fmt.Fprint(writer, `Usage: vaultkey devices [--json]
 
@@ -571,7 +397,7 @@ Windows SERIALCOMM registry. Each candidate is opened and sent HELLO. Use
 	case "status":
 		fmt.Fprint(writer, "Usage: vaultkey status [--json]\n\nShows lock, RTC, storage, startup, display, and USB state.\n")
 	case "doctor":
-		fmt.Fprint(writer, "Usage: vaultkey doctor\n\nRead-only connection and authorization checks.\n")
+		fmt.Fprint(writer, "Usage: vaultkey doctor [--json]\n\nRead-only connection and authorization checks. Use --json for a machine-readable report.\n")
 	case "time":
 		fmt.Fprint(writer, `Usage:
   vaultkey time get [--json]
@@ -623,6 +449,8 @@ confirmation for non-interactive use.
 		fmt.Fprint(writer, "Usage: vaultkey lock [--json]\n\nLocks the vault, cancels HID output, and revokes CDC authorization.\n")
 	case "watch":
 		fmt.Fprint(writer, "Usage: vaultkey watch [--interval DUR] [--json]\n\nPrints status at each interval as JSON Lines with --json.\n")
+	case "version":
+		fmt.Fprint(writer, "Usage: vaultkey version [--json]\n\nPrints the app version. --json adds platform and protocol metadata.\n")
 	default:
 		printUsage(writer)
 	}

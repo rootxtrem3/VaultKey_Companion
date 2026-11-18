@@ -65,6 +65,17 @@ func (c *Client) SetLogger(logger func(string)) {
 // PortName returns the underlying serial port path.
 func (c *Client) PortName() string { return c.port.Name() }
 
+// Done is closed when the connection is no longer usable.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+// Err reports the terminal connection error, or nil while the port is open.
+// An intentional Close reports ErrClosed.
+func (c *Client) Err() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	return c.readErr
+}
+
 func (c *Client) logf(format string, arguments ...any) {
 	c.logMu.Lock()
 	logger := c.log
@@ -111,7 +122,7 @@ func (c *Client) lastReadError() error {
 }
 
 func (c *Client) readLoop() {
-	reader := bufio.NewReaderSize(c.port, maxResponseLine)
+	reader := bufio.NewReaderSize(&idleReader{reader: c.port, done: c.done}, maxResponseLine)
 	for {
 		line, err := reader.ReadSlice('\n')
 		if err == bufio.ErrBufferFull {

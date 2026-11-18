@@ -1,15 +1,12 @@
 package cli
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
-	"net"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/rootxtrem3/VaultKey_Companion/internal/vaultkey"
+	"github.com/rootxtrem3/VaultKey_Companion/internal/apperr"
+	"github.com/rootxtrem3/VaultKey_Companion/pkg/vaultkey"
 )
 
 func TestParseGlobalsAnywhere(t *testing.T) {
@@ -112,83 +109,12 @@ func TestDeviceMessages(t *testing.T) {
 		"invalid_credential":          exitUsage,
 	}
 	for code, expected := range cases {
-		_, actual := deviceMessage(&vaultkey.DeviceError{Code: code})
-		if actual != expected {
-			t.Errorf("%s: got exit %d, want %d", code, actual, expected)
+		info := apperr.Classify(&vaultkey.DeviceError{Code: code})
+		if info.ExitCode != expected {
+			t.Errorf("%s: got exit %d, want %d", code, info.ExitCode, expected)
 		}
-	}
-}
-
-type pipePort struct {
-	net.Conn
-}
-
-func (pipePort) Name() string { return "test" }
-
-func TestFetchAllPagination(t *testing.T) {
-	server, clientSide := net.Pipe()
-	t.Cleanup(func() { _ = clientSide.Close(); _ = server.Close() })
-
-	go func() {
-		reader := bufio.NewReader(server)
-		writer := bufio.NewWriter(server)
-		for {
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				return
-			}
-			var request map[string]any
-			if err := json.Unmarshal(line, &request); err != nil {
-				return
-			}
-			offset := uint32(request["offset"].(float64))
-			credentials := []map[string]any{}
-			if offset == 0 {
-				for id := 1; id <= 25; id++ {
-					credentials = append(credentials, map[string]any{
-						"id": id, "service": "service",
-					})
-				}
-			} else {
-				for id := 26; id <= 30; id++ {
-					credentials = append(credentials, map[string]any{
-						"id": id, "service": "service",
-					})
-				}
-			}
-			response := map[string]any{
-				"v": 1, "id": request["id"], "ok": true,
-				"offset": offset, "limit": 25,
-				"credential_total": 30, "totp_total": 0,
-				"credentials": credentials, "totp": []any{},
-			}
-			encoded, _ := json.Marshal(response)
-			_, _ = writer.Write(append(encoded, '\n'))
-			_ = writer.Flush()
+		if info.DeviceCode != code {
+			t.Errorf("%s: device code %q", code, info.DeviceCode)
 		}
-	}()
-
-	client := vaultkey.New(pipePort{Conn: clientSide})
-	t.Cleanup(func() { _ = client.Close() })
-	application := &app{
-		stdout:  &strings.Builder{},
-		stderr:  &strings.Builder{},
-		timeout: time.Second,
-		ctx:     context.Background(),
-	}
-	aggregate, err := application.fetchAll(client, "")
-	if err != nil {
-		t.Fatalf("fetchAll: %v", err)
-	}
-	if aggregate.CredentialTotal != 30 || len(aggregate.Credentials) != 30 {
-		t.Fatalf("unexpected aggregate: total=%d len=%d",
-			aggregate.CredentialTotal, len(aggregate.Credentials))
-	}
-	seen := map[uint32]bool{}
-	for _, entry := range aggregate.Credentials {
-		if seen[entry.ID] {
-			t.Fatalf("duplicate ID %d", entry.ID)
-		}
-		seen[entry.ID] = true
 	}
 }

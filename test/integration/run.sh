@@ -72,6 +72,31 @@ if ! python3 "$ROOT/test/integration/check_prompts.py"; then
   STATUS=1
 fi
 
+# Restart the simulator once more so the session checks start from a clean log
+# and state; the one-open assertion counts HELLO lines in the simulator log.
+kill "$SIM_PID" 2>/dev/null || true
+wait "$SIM_PID" 2>/dev/null || true
+rm -f "$PORT"
+printf '%s\n' '{"locked": false, "authorized": true, "drop": ""}' > "$WORK/state.json"
+: > "$WORK/sim.log"
+python3 "$ROOT/test/integration/sim.py" &
+SIM_PID=$!
+for _ in $(seq 1 100); do
+  [ -e "$PORT" ] && break
+  sleep 0.05
+done
+if [ ! -e "$PORT" ]; then
+  echo "simulator did not create $PORT" >&2
+  cat "$WORK/sim.log" >&2 || true
+  exit 1
+fi
+
+echo
+echo "== session checks =="
+if ! python3 "$ROOT/test/integration/check_session.py"; then
+  STATUS=1
+fi
+
 echo
 if [ "$STATUS" -eq 0 ]; then
   echo "integration checks passed"

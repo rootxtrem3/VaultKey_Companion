@@ -44,7 +44,8 @@ read passwords back, unlock the vault, or bypass the physical PIN.
 - `lock` clears the vault lock state and revokes CDC authorization.
 - `watch` polls status until interrupted.
 - JSON output for scripts (`--json`; `watch --json` emits JSON Lines).
-- No third-party Go modules and no cgo.
+- No third-party Go modules; the CLI is cgo-free. The optional Windows DLL
+  prototype in `cmd/vaultkey-dll` uses cgo and is not part of the release.
 
 ## Security model
 
@@ -128,6 +129,22 @@ Release artifacts for Linux, macOS, and Windows (amd64 and arm64) plus
 ```sh
 make release               # writes to dist/
 ```
+
+### Optional Windows DLL prototype
+
+`cmd/vaultkey-dll` is an experimental x64 DLL that wraps the same protocol
+client behind one JSON-in/JSON-out C entry point. It needs cgo plus a
+mingw-w64 toolchain and is deliberately kept out of `make release`:
+
+```sh
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+go build -buildmode=c-shared -trimpath \
+  -ldflags '-s -w -X main.version=0.1.0 -X main.commit=prototype -X main.buildDate=2026-11-17T00:00:00Z' \
+  -o dist/vaultkey_windows_amd64.dll ./cmd/vaultkey-dll
+```
+
+See [docs/DLL_BUILD_NOTES.md](docs/DLL_BUILD_NOTES.md) for the build failures,
+fixes, known gaps, and the reproduction script.
 
 The same six targets cross-compile from any host:
 
@@ -378,14 +395,20 @@ list of what was not tested.
 
 ```text
 cmd/vaultkey/            process entry point and ldflags version variables
+cmd/vaultkey-dll/        optional Windows DLL prototype (cgo; not in release)
 internal/cli/            argument parsing, commands, output, exit codes
+internal/dllapi/         DLL error mapping shared with the cgo bridge
 internal/vaultkey/       protocol client, typed API, validation, limits
 internal/transport/      Linux/macOS termios, Windows DCB, port discovery
 internal/prompt/         hidden terminal input and confirmation
 test/integration/        PTY simulator and end-to-end checks (test-only)
+ui/index.html            single-file sample UI (demo + WebView2 host bridge)
+ui/README.md             sample UI modes, host contract, and limits
 docs/TEST_REPORT.md      verification record and gaps
 docs/WINDOWS_AGENT_HANDOFF.md  brief for the Windows UI/session implementation
+docs/DLL_BUILD_NOTES.md  DLL prototype build failures and reproduction
 scripts/build-release.sh cross-build helper
+scripts/reproduce-dll-build.sh  reproduces the DLL build and its failures
 ```
 
 ## Limitations
@@ -403,3 +426,6 @@ scripts/build-release.sh cross-build helper
 - Go cannot zeroize immutable strings; host memory is not a secure enclave.
 - Windows and macOS binaries were cross-compiled but only Linux was executed in
   the development environment.
+- The Windows DLL prototype was built and statically inspected, but not loaded
+  on Windows and not tested against a rev-D board. Only amd64 is built; no
+  arm64 mingw toolchain is available.

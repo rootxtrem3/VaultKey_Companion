@@ -82,4 +82,41 @@ const (
 	MaxLineLength = 2048 // firmware accepts 2048 bytes before the LF
 	MaxPageLimit  = 25
 	MaxPageOffset = 256
+
+	MaxCredentials = 128
+	MaxTOTP        = 128
 )
+
+// Limits is the machine-readable description of the firmware limits.
+type Limits struct {
+	Service     int `json:"service"`
+	Username    int `json:"username"`
+	Password    int `json:"password"`
+	URL         int `json:"url"`
+	Notes       int `json:"notes"`
+	Query       int `json:"query"`
+	TOTPURI     int `json:"totp_uri"`
+	LineLength  int `json:"request_line"`
+	PageLimit   int `json:"page_limit"`
+	PageOffset  int `json:"page_offset"`
+	Credentials int `json:"credentials"`
+	TOTP        int `json:"totp"`
+}
+
+// CurrentLimits returns the limits understood by this build.
+func CurrentLimits() Limits {
+	return Limits{
+		Service:     MaxService,
+		Username:    MaxUsername,
+		Password:    MaxPassword,
+		URL:         MaxURL,
+		Notes:       MaxNotes,
+		Query:       MaxQuery,
+		TOTPURI:     MaxTOTPURI,
+		LineLength:  MaxLineLength,
+		PageLimit:   MaxPageLimit,
+		PageOffset:  MaxPageOffset,
+		Credentials: MaxCredentials,
+		TOTP:        MaxTOTP,
+	}
+}

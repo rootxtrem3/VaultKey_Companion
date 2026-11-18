@@ -16,8 +16,7 @@ import (
 	"time"
 
 	"github.com/rootxtrem3/VaultKey_Companion/internal/prompt"
-	"github.com/rootxtrem3/VaultKey_Companion/internal/transport"
-	"github.com/rootxtrem3/VaultKey_Companion/internal/vaultkey"
+	"github.com/rootxtrem3/VaultKey_Companion/pkg/vaultkey"
 )
 
 type deviceRow struct {
@@ -42,37 +41,12 @@ func (a *app) runDevices(arguments []string) int {
 		return exitUsage
 	}
 
-	ports := []string{}
-	if a.port != "" {
-		ports = append(ports, a.port)
-	} else {
-		detected, err := transport.Candidates()
-		if err != nil {
-			return a.fail(err)
-		}
-		ports = detected
+	rows, err := vaultkey.Discover(a.ctx, a.openOptions(a.port))
+	if err != nil {
+		return a.fail(err)
 	}
-	rows := make([]deviceRow, 0, len(ports))
-	for _, port := range ports {
-		result := a.probe(port)
-		row := deviceRow{Port: port}
-		switch {
-		case result.err != nil:
-			row.State = "unreachable"
-			row.Error = result.err.Error()
-		case result.product == "VaultKey":
-			row.State = "vaultkey"
-			row.Product = result.hello.Product
-			row.Firmware = result.hello.Firmware
-			row.Hardware = result.hello.Hardware
-			row.Protocol = result.hello.Protocol
-		case result.product != "":
-			row.State = "other-device"
-			row.Product = result.product
-		default:
-			row.State = "no-response"
-		}
-		rows = append(rows, row)
+	if rows == nil {
+		rows = []vaultkey.DeviceInfo{}
 	}
 
 	if *jsonOutput {
@@ -108,24 +82,25 @@ func (a *app) runInfo(arguments []string) int {
 		return code
 	}
 
-	client, hello, err := a.connect()
+	device, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
-	defer client.Close()
+	defer device.Close()
+	hello := device.Hello()
 
 	if *jsonOutput {
 		output := struct {
 			Port   string         `json:"port"`
 			Device vaultkey.Hello `json:"device"`
-		}{Port: client.PortName(), Device: hello}
+		}{Port: device.PortName(), Device: hello}
 		if err := writeJSON(a.stdout, output); err != nil {
 			return a.fail(err)
 		}
 		return exitOK
 	}
 
-	fmt.Fprintf(a.stdout, "Port:      %s\n", client.PortName())
+	fmt.Fprintf(a.stdout, "Port:      %s\n", device.PortName())
 	fmt.Fprintf(a.stdout, "Product:   %s\n", hello.Product)
 	fmt.Fprintf(a.stdout, "Hardware:  %s\n", hello.Hardware)
 	fmt.Fprintf(a.stdout, "Firmware:  %s\n", hello.Firmware)
@@ -141,15 +116,16 @@ func (a *app) runStatus(arguments []string) int {
 		return code
 	}
 
-	client, hello, err := a.connect()
+	device, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
-	defer client.Close()
+	defer device.Close()
+	hello := device.Hello()
 
 	ctx, cancel := a.timeoutContext()
 	defer cancel()
-	status, err := client.Status(ctx)
+	status, err := device.Status(ctx)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -159,14 +135,14 @@ func (a *app) runStatus(arguments []string) int {
 			Port   string          `json:"port"`
 			Device vaultkey.Hello  `json:"device"`
 			Status vaultkey.Status `json:"status"`
-		}{Port: client.PortName(), Device: hello, Status: status}
+		}{Port: device.PortName(), Device: hello, Status: status}
 		if err := writeJSON(a.stdout, output); err != nil {
 			return a.fail(err)
 		}
 		return exitOK
 	}
 
-	fmt.Fprintf(a.stdout, "Port:          %s\n", client.PortName())
+	fmt.Fprintf(a.stdout, "Port:          %s\n", device.PortName())
 	fmt.Fprintf(a.stdout, "Device:        %s %s, firmware %s, protocol %d\n",
 		hello.Product, hello.Hardware, hello.Firmware, hello.Protocol)
 	fmt.Fprintf(a.stdout, "Locked:        %s\n", yesNo(status.Locked))
@@ -206,93 +182,39 @@ func derefCount(value *uint64) uint64 {
 
 func (a *app) runDoctor(arguments []string) int {
 	flags := newFlagSet("doctor", "Run read-only connection and authorization checks.", a.stderr)
+	jsonOutput := flags.Bool("json", false, "print JSON")
 	ok, code := parseFlags(flags, arguments)
 	if !ok {
 		return code
 	}
 
-	fmt.Fprintln(a.stdout, "VaultKey doctor")
-	fmt.Fprintln(a.stdout)
-	fmt.Fprintf(a.stdout, "[ok]   app %s on %s/%s\n", a.version, osName(), osArch())
-
-	if a.port == "" {
-		ports, err := transport.Candidates()
-		if err != nil {
-			fmt.Fprintf(a.stdout, "[warn] candidate enumeration failed: %v\n", err)
-			fmt.Fprintln(a.stdout, "       pass --port to select the CDC device")
-		} else {
-			fmt.Fprintf(a.stdout, "[ok]   candidate ports: %d\n", len(ports))
-		}
-	} else {
-		fmt.Fprintf(a.stdout, "[ok]   selected port: %s\n", a.port)
-	}
-
-	client, hello, err := a.connect()
+	device, err := a.connect()
 	if err != nil {
-		fmt.Fprintf(a.stdout, "[fail] connection: %v\n", err)
-		return exitConnection
-	}
-	defer client.Close()
-	fmt.Fprintf(a.stdout, "[ok]   %s: %s %s, firmware %s, protocol %d\n",
-		client.PortName(), hello.Product, hello.Hardware, hello.Firmware, hello.Protocol)
-
-	ctx, cancel := a.timeoutContext()
-	defer cancel()
-	status, err := client.Status(ctx)
-	if err != nil {
-		fmt.Fprintf(a.stdout, "[fail] GET_STATUS: %v\n", err)
 		return a.fail(err)
 	}
-	fmt.Fprintln(a.stdout, "[ok]   GET_STATUS answered")
+	defer device.Close()
 
-	if status.Locked {
-		fmt.Fprintln(a.stdout, "[warn] vault is locked; unlock it with the PIN to manage entries")
-	} else {
-		fmt.Fprintln(a.stdout, "[ok]   vault is unlocked")
+	report, err := device.Doctor(a.ctx)
+	if err != nil {
+		return a.fail(err)
 	}
-	if status.Provisioning {
-		fmt.Fprintln(a.stdout, "[ok]   CDC provisioning is authorized")
-	} else {
-		fmt.Fprintln(a.stdout, `[warn] CDC provisioning is not authorized; choose USB Functions -> "Authorize CDC 5 min"`)
-	}
-	if status.RTC == "ready" {
-		fmt.Fprintln(a.stdout, "[ok]   RTC status is ready")
-	} else {
-		fmt.Fprintf(a.stdout, "[warn] RTC status: %s\n", status.RTC)
-	}
-	if status.Storage == "ready" {
-		fmt.Fprintln(a.stdout, "[ok]   storage is ready")
-	} else {
-		fmt.Fprintf(a.stdout, "[warn] storage status: %s\n", status.Storage)
-	}
-	fmt.Fprintf(a.stdout, "[%s] USB mounted=%s cdc=%s hid=%s\n",
-		okWord(status.USBMounted && status.CDC),
-		yesNo(status.USBMounted), yesNo(status.CDC), yesNo(status.HID))
-
-	getCtx, getCancel := a.timeoutContext()
-	clock, timeErr := client.Time(getCtx)
-	getCancel()
-	if timeErr != nil {
-		if vaultkey.IsCode(timeErr, "rtc_time_invalid") {
-			fmt.Fprintln(a.stdout, "[warn] RTC time is not set or not valid")
-		} else {
-			fmt.Fprintf(a.stdout, "[warn] GET_TIME: %v\n", timeErr)
+	if *jsonOutput {
+		if err := writeJSON(a.stdout, report); err != nil {
+			return a.fail(err)
 		}
-	} else {
-		fmt.Fprintf(a.stdout, "[ok]   RTC UTC %s (unix %d)\n", formatClock(clock), clock.Unix)
+		return exitOK
+	}
+
+	fmt.Fprintln(a.stdout, "VaultKey doctor")
+	fmt.Fprintln(a.stdout)
+	fmt.Fprintf(a.stdout, "[ok]   app %s on %s/%s\n", a.version, runtime.GOOS, runtime.GOARCH)
+	for _, check := range report.Checks {
+		fmt.Fprintf(a.stdout, "[%s]   %s\n", check.Status, check.Message)
+		if check.Detail != "" {
+			fmt.Fprintf(a.stdout, "       %s\n", check.Detail)
+		}
 	}
 	return exitOK
-}
-
-func osName() string { return runtime.GOOS }
-
-func osArch() string { return runtime.GOARCH }
-
-func okWord(good bool) string {
-	if good {
-		return "ok"
-	}
-	return "warn"
 }
 
 func (a *app) runTime(arguments []string) int {
@@ -325,7 +247,7 @@ func (a *app) runTimeGet(arguments []string) int {
 		return code
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -393,7 +315,7 @@ func (a *app) runTimeSet(arguments []string) int {
 		return a.fail(err)
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -484,7 +406,7 @@ func (a *app) runList(arguments []string) int {
 		return exitUsage
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -492,7 +414,7 @@ func (a *app) runList(arguments []string) int {
 
 	result := listOutput{All: *all}
 	if *all {
-		aggregate, err := a.fetchAll(client, *query)
+		aggregate, err := client.ListAll(a.ctx, *query, a.timeout)
 		if err != nil {
 			return a.fail(err)
 		}
@@ -560,48 +482,6 @@ func (a *app) runList(arguments []string) int {
 	return exitOK
 }
 
-func (a *app) fetchAll(client *vaultkey.Client, query string) (vaultkey.ServiceList, error) {
-	aggregate := vaultkey.ServiceList{
-		Credentials: []vaultkey.CredentialSummary{},
-		TOTP:        []vaultkey.TOTPSummary{},
-	}
-	seenCredentials := make(map[uint32]struct{})
-	seenTOTP := make(map[uint32]struct{})
-	offset := uint32(0)
-	const limit = vaultkey.MaxPageLimit
-
-	for page := 0; page < 64; page++ {
-		ctx, cancel := a.timeoutContext()
-		result, err := client.List(ctx, query, offset, limit)
-		cancel()
-		if err != nil {
-			return aggregate, err
-		}
-		aggregate.CredentialTotal = result.CredentialTotal
-		aggregate.TOTPTotal = result.TOTPTotal
-		for _, entry := range result.Credentials {
-			if _, exists := seenCredentials[entry.ID]; !exists {
-				seenCredentials[entry.ID] = struct{}{}
-				aggregate.Credentials = append(aggregate.Credentials, entry)
-			}
-		}
-		for _, entry := range result.TOTP {
-			if _, exists := seenTOTP[entry.ID]; !exists {
-				seenTOTP[entry.ID] = struct{}{}
-				aggregate.TOTP = append(aggregate.TOTP, entry)
-			}
-		}
-		if offset+limit >= result.CredentialTotal && offset+limit >= result.TOTPTotal {
-			break
-		}
-		offset += limit
-		if offset > vaultkey.MaxPageOffset {
-			return aggregate, &vaultkey.RequestError{Message: "pagination exceeded the device limit"}
-		}
-	}
-	return aggregate, nil
-}
-
 func (a *app) runAddCredential(arguments []string) int {
 	flags := newFlagSet("add-credential", "Add a credential.", a.stderr)
 	service := flags.String("service", "", "service name (required)")
@@ -640,7 +520,7 @@ func (a *app) runAddCredential(arguments []string) int {
 	}
 	a.warnHID(input)
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -722,7 +602,7 @@ func (a *app) runUpdateCredential(arguments []string) int {
 	}
 	a.warnHID(input)
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -776,7 +656,7 @@ func (a *app) runAddTOTP(arguments []string) int {
 		return a.fail(err)
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -823,7 +703,7 @@ func (a *app) runDelete(arguments []string) int {
 	}
 	id := uint32(*idValue)
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -871,9 +751,9 @@ func (a *app) runDelete(arguments []string) int {
 	return exitOK
 }
 
-func (a *app) findLabel(client *vaultkey.Client, entryType vaultkey.EntryType,
+func (a *app) findLabel(client *vaultkey.Session, entryType vaultkey.EntryType,
 	id uint32) (string, error) {
-	list, err := a.fetchAll(client, "")
+	list, err := client.ListAll(a.ctx, "", a.timeout)
 	if err != nil {
 		return "", err
 	}
@@ -905,7 +785,7 @@ func (a *app) runLock(arguments []string) int {
 		return code
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}
@@ -940,7 +820,7 @@ func (a *app) runWatch(arguments []string) int {
 		return exitUsage
 	}
 
-	client, _, err := a.connect()
+	client, err := a.connect()
 	if err != nil {
 		return a.fail(err)
 	}

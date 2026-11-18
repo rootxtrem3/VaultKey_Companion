@@ -18,9 +18,9 @@ make integration
 ```
 
 Requirements: `bash`, `python3` (3.8+), and Go. `run.sh` builds a temporary
-binary, starts a fresh simulator, runs both check suites, and cleans up.
+binary, starts a fresh simulator, runs all three check suites, and cleans up.
 
-Expected result: 55 CLI checks and 18 hidden-prompt checks, all passing.
+Expected result: 55 CLI checks, 18 hidden-prompt checks, and 35 session checks, all passing.
 
 ## Files
 
@@ -29,6 +29,7 @@ Expected result: 55 CLI checks and 18 hidden-prompt checks, all passing.
 | `sim.py` | Creates a real PTY pair, links it as `$VK_WORK/tty`, and speaks protocol v1. State lives in `$VK_WORK/state.json`. |
 | `check_cli.sh` | Exercises discovery, info/status/doctor, clock, list/pagination, add/update/TOTP/delete, lock, authorization errors, ambiguous timeout, usage errors, and watch. |
 | `check_prompts.py` | Drives hidden prompts through a PTY and checks echo state, mismatch handling, Ctrl-C cleanup, and transcript leakage. |
+| `check_session.py` | Drives `vaultkey session` like the desktop bridge: one process, several commands, watch events, malformed/oversized lines, an ambiguous mutation, shutdown, EOF, unauthorized, and locked states. |
 | `run.sh` | Orchestrates a clean run. |
 
 ## Simulator state
@@ -57,5 +58,5 @@ stack.
 - `PORT`: PTY link path (default: `$VK_WORK/tty`).
 - `VK_LINK`, `VK_STATE`, `VK_LOG`: simulator paths.
 
-`check_cli.sh` and `check_prompts.py` can be run separately if a simulator is
+`check_cli.sh`, `check_prompts.py`, and `check_session.py` can be run separately if a simulator is
 already listening and has a fresh state.

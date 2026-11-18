@@ -13,6 +13,7 @@ import pty
 import random
 import select
 import sys
+import time
 import tty
 
 WORK = os.environ.get("VK_WORK", os.path.join(os.environ.get("TMPDIR", "/tmp"), "vaultkey-it"))
